@@ -27,10 +27,12 @@ const CFG = {
   wpmMax: 1100,
   wpmStart: 250,
   avgCharsPerWord: 5.5,  // for px/sec estimate fallback
-  detectHz: 24,          // gaze-inference rate; rendering stays at full rAF so the
-                         // heavy detectForVideo() call doesn't block every paint frame
-  maxStepSec: 0.02,      // cap per-frame motion: after a hitch we never leap more
-                         // than this many seconds of travel -> smooth, small steps
+  detectHz: 24,          // gaze-inference rate; kept off the scroll path entirely
+  // --- Scroll engine (compositor-driven, see startStripAnimation) ---
+  animSpanSec: 30,       // length of the single linear animation before we re-baseline
+  controlIntervalMs: 120,// how often the gaze controller updates speed + tops up words
+  recycleIntervalMs: 1500,// how often we re-baseline (prune off-screen words); rare seam
+  prefillSec: 3,         // seconds of words kept ready to the right (main-thread-stall margin)
 };
 
 const SAMPLE_TEXT = (
@@ -129,6 +131,15 @@ async function startCamera() {
 // Per-frame gaze detection
 // ---------------------------------------------------------------------------
 function detectLoop(now) {
+  // Main-thread frame cadence (every rAF). The visible scroll runs on the
+  // compositor, so this number can dip during inference without the scroll
+  // stuttering — it's here as a health signal, not the scroll's frame rate.
+  if (state.lastRenderFrame) {
+    const rdt = (now - state.lastRenderFrame) / 1000;
+    if (rdt > 0) state.rfps = state.rfps * 0.9 + (1 / rdt) * 0.1;
+  }
+  state.lastRenderFrame = now;
+
   if (state.landmarker && el.cam.readyState >= 2) {
     // Throttle the heavy inference call so it doesn't run on every paint frame.
     // Rendering keeps its own full-rate rAF loop; the gaze controller only needs
@@ -235,11 +246,14 @@ function capturePoint(leftPct, label) {
 // ---------------------------------------------------------------------------
 // Word stream + closed-loop controller
 // ---------------------------------------------------------------------------
-let words = [];     // [{ el, width }]
-let offset = 0;     // current translateX of #stream (<= 0)
-let nextWord = 0;   // index into SAMPLE_TEXT (loops)
+let words = [];        // [{ el, width }]
+let offset = 0;        // strip translateX at the current animation's start (px)
+let nextWord = 0;      // index into SAMPLE_TEXT (loops)
 let avgWordPx = 0;
-let runLast = 0;
+const animV0 = 1000;   // base animation velocity (px/sec); real speed = V0 * playbackRate
+let streamAnim = null; // compositor-driven Web Animation translating the strip
+let lastControl = 0;   // last time the controller/refill ran
+let lastRecycle = 0;   // last time we re-baselined (pruned off-screen words)
 
 function addWord() {
   const w = document.createElement("span");
@@ -258,31 +272,54 @@ function contentWidth() {
   return s;
 }
 
+// Current translateX of the strip, derived from the running animation's own clock
+// (which advances at V0 * playbackRate). Stays correct regardless of how
+// playbackRate has been changed over the animation's life.
+function currentOffset() {
+  if (!streamAnim) return offset;
+  const ct = streamAnim.currentTime || 0; // ms in the animation's timeline
+  return offset - animV0 * (ct / 1000);
+}
+
+// (Re)start the single long linear animation from `offset`, running on the GPU
+// compositor. We keep ONE animation alive and set speed via playbackRate, so the
+// visible motion never touches the main thread — face inference can hitch the main
+// thread without the scroll stuttering. Restarted only when we re-baseline.
+function startStripAnimation(playbackRate) {
+  const D = CFG.animSpanSec;
+  const from = offset;
+  const to = offset - animV0 * D;
+  el.stream.style.transform = `translate3d(${from}px,0,0)`;
+  if (streamAnim) streamAnim.cancel();
+  streamAnim = el.stream.animate(
+    [{ transform: `translate3d(${from}px,0,0)` },
+     { transform: `translate3d(${to}px,0,0)` }],
+    { duration: D * 1000, easing: "linear", fill: "forwards" }
+  );
+  streamAnim.playbackRate = playbackRate;
+}
+
 function startRun() {
   state.running = true;
   document.body.classList.add("running");
   el.run.textContent = "Pause";
-  // Seed the strip starting just off the right edge.
-  offset = window.innerWidth;
-  el.stream.style.transform = `translate3d(${offset}px, 0, 0)`;
-  runLast = performance.now();
-  state.lastRenderFrame = 0;
-  requestAnimationFrame(renderLoop);
+  if (!words.length) offset = window.innerWidth; // first run: seed off the right edge
+  const t = performance.now();
+  lastControl = t - CFG.controlIntervalMs;       // run the controller immediately
+  lastRecycle = t;
+  startStripAnimation(0);                         // start parked; controller sets speed
+  requestAnimationFrame(controlLoop);
 }
 
-function renderLoop(now) {
+// Decoupled from rendering. Updates speed (via playbackRate), tops up words on the
+// right, and on a slow cadence prunes/re-baselines. Jank here (e.g. an inference
+// spike landing on the same frame) never stutters the scroll — that's the whole point.
+function controlLoop(now) {
   if (!state.running) return;
-  // Cap dt small so a single dropped/heavy frame can never produce a big visible
-  // jump — the strip always advances in small, even steps.
-  const dt = Math.min(CFG.maxStepSec, (now - runLast) / 1000);
-  runLast = now;
-
-  // render fps
-  if (state.lastRenderFrame) {
-    const rdt = (now - state.lastRenderFrame) / 1000;
-    if (rdt > 0) state.rfps = state.rfps * 0.9 + (1 / rdt) * 0.1;
-  }
-  state.lastRenderFrame = now;
+  requestAnimationFrame(controlLoop);
+  if (now - lastControl < CFG.controlIntervalMs) return;
+  const dt = (now - lastControl) / 1000;
+  lastControl = now;
 
   // --- Controller: integrate gaze error into speed (drives gaze back to target).
   const error = state.gazeNorm - CFG.targetGaze; // + = looking ahead/right
@@ -295,31 +332,37 @@ function renderLoop(now) {
   const px = avgWordPx || (CFG.avgCharsPerWord * parseFloat(getComputedStyle(el.stream).fontSize) * 0.5);
   const pxPerSec = (state.wpm / 60) * px;
 
-  // --- Advance left.
-  offset -= pxPerSec * dt;
+  // --- Set speed seamlessly via playbackRate (no restart, no seam).
+  if (streamAnim) streamAnim.playbackRate = pxPerSec / animV0;
 
-  // --- Ensure content fills to the right.
-  while (offset + contentWidth() < window.innerWidth + 600) {
+  // --- Top up words on the right. Appending extends content rightward without
+  // shifting the visible strip, so it needs no re-baseline. Pre-fill enough to
+  // ride out a main-thread stall.
+  const cur = currentOffset();
+  const need = window.innerWidth + pxPerSec * CFG.prefillSec + 600;
+  while (cur + contentWidth() < need) {
     const wpx = addWord();
     if (words.length) avgWordPx = avgWordPx * 0.95 + wpx * 0.05;
   }
 
-  // --- Prune words fully off the left; compensate offset so visuals don't jump.
-  while (words.length && offset + words[0].width < -100) {
-    const removed = words.shift();
-    el.stream.removeChild(removed.el);
-    offset += removed.width;
+  // --- Re-baseline on a slow cadence: prune fully-off-screen words and restart the
+  // animation from the (compensated) current position. Positionally seamless; this
+  // is the only restart, kept rare so any commit cost is unnoticeable. It also
+  // resets the animation clock so animSpanSec is never exhausted.
+  if (now - lastRecycle >= CFG.recycleIntervalMs) {
+    lastRecycle = now;
+    let newOffset = currentOffset();
+    while (words.length && newOffset + words[0].width < -120) {
+      const removed = words.shift();
+      el.stream.removeChild(removed.el);
+      newOffset += removed.width; // compensate so remaining words stay put
+    }
+    offset = newOffset;
+    startStripAnimation(pxPerSec / animV0);
   }
-
-  // translate3d keeps the strip on its own GPU compositor layer for smoother
-  // motion. Round to whole device pixels to avoid subpixel-snap shimmer.
-  const px3d = Math.round(offset * devicePixelRatio) / devicePixelRatio;
-  el.stream.style.transform = `translate3d(${px3d}px, 0, 0)`;
 
   // --- Gaze marker position (normalized -1..1 -> 0..100% of width).
   el.marker.style.left = `${((state.gazeNorm + 1) / 2) * 100}%`;
-
-  requestAnimationFrame(renderLoop);
 }
 
 function toggleRun() {
@@ -327,6 +370,9 @@ function toggleRun() {
     startRun();
   } else {
     state.running = false;
+    offset = currentOffset();                       // freeze where we are
+    if (streamAnim) { streamAnim.cancel(); streamAnim = null; }
+    el.stream.style.transform = `translate3d(${offset}px,0,0)`;
     document.body.classList.remove("running");
     el.run.textContent = "Run";
   }
@@ -338,7 +384,8 @@ function toggleRun() {
 function updateDebug() {
   if (el.debug.classList.contains("hidden")) return;
   el.debug.textContent =
-    `face:   ${state.faceSeen ? "yes" : "NO"}   fps: ${state.fps.toFixed(0)} (gaze) ${state.rfps.toFixed(0)} (render)\n` +
+    `face:   ${state.faceSeen ? "yes" : "NO"}   ${state.fps.toFixed(0)} gaze / ${state.rfps.toFixed(0)} main fps\n` +
+    `(scroll runs on the GPU compositor, not main fps)\n` +
     `iris:   ${state.irisRatio.toFixed(3)}\n` +
     `yaw:    ${state.headYaw.toFixed(3)}\n` +
     `raw:    ${state.gazeRaw.toFixed(3)}  [${state.calib.min.toFixed(2)}..${state.calib.max.toFixed(2)}]\n` +
