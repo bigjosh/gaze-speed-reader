@@ -27,6 +27,10 @@ const CFG = {
   wpmMax: 1100,
   wpmStart: 250,
   avgCharsPerWord: 5.5,  // for px/sec estimate fallback
+  detectHz: 24,          // gaze-inference rate; rendering stays at full rAF so the
+                         // heavy detectForVideo() call doesn't block every paint frame
+  maxStepSec: 0.02,      // cap per-frame motion: after a hitch we never leap more
+                         // than this many seconds of travel -> smooth, small steps
 };
 
 const SAMPLE_TEXT = (
@@ -48,8 +52,11 @@ const state = {
   wpm: CFG.wpmStart,
   irisRatio: 0,
   headYaw: 0,
-  fps: 0,
+  fps: 0,             // gaze-inference rate (Hz)
+  rfps: 0,            // render rate (Hz)
   lastFrame: 0,
+  lastDetect: 0,
+  lastRenderFrame: 0,
   faceSeen: false,
 };
 
@@ -123,17 +130,22 @@ async function startCamera() {
 // ---------------------------------------------------------------------------
 function detectLoop(now) {
   if (state.landmarker && el.cam.readyState >= 2) {
-    if (el.cam.currentTime !== state.lastVideoTime) {
+    // Throttle the heavy inference call so it doesn't run on every paint frame.
+    // Rendering keeps its own full-rate rAF loop; the gaze controller only needs
+    // a slow control signal, so running inference at ~detectHz frees the main
+    // thread to paint smoothly between detections.
+    const due = now - state.lastDetect >= 1000 / CFG.detectHz;
+    if (due && el.cam.currentTime !== state.lastVideoTime) {
       state.lastVideoTime = el.cam.currentTime;
       const res = state.landmarker.detectForVideo(el.cam, now);
       processResult(res);
+      // inference fps (measured only on frames we actually ran inference)
+      if (state.lastDetect) {
+        const dt = (now - state.lastDetect) / 1000;
+        state.fps = state.fps * 0.9 + (1 / dt) * 0.1;
+      }
+      state.lastDetect = now;
     }
-    // fps
-    if (state.lastFrame) {
-      const dt = (now - state.lastFrame) / 1000;
-      state.fps = state.fps * 0.9 + (1 / dt) * 0.1;
-    }
-    state.lastFrame = now;
   }
   updateDebug();
   requestAnimationFrame(detectLoop);
@@ -252,15 +264,25 @@ function startRun() {
   el.run.textContent = "Pause";
   // Seed the strip starting just off the right edge.
   offset = window.innerWidth;
-  el.stream.style.transform = `translateX(${offset}px)`;
+  el.stream.style.transform = `translate3d(${offset}px, 0, 0)`;
   runLast = performance.now();
+  state.lastRenderFrame = 0;
   requestAnimationFrame(renderLoop);
 }
 
 function renderLoop(now) {
   if (!state.running) return;
-  const dt = Math.min(0.05, (now - runLast) / 1000);
+  // Cap dt small so a single dropped/heavy frame can never produce a big visible
+  // jump — the strip always advances in small, even steps.
+  const dt = Math.min(CFG.maxStepSec, (now - runLast) / 1000);
   runLast = now;
+
+  // render fps
+  if (state.lastRenderFrame) {
+    const rdt = (now - state.lastRenderFrame) / 1000;
+    if (rdt > 0) state.rfps = state.rfps * 0.9 + (1 / rdt) * 0.1;
+  }
+  state.lastRenderFrame = now;
 
   // --- Controller: integrate gaze error into speed (drives gaze back to target).
   const error = state.gazeNorm - CFG.targetGaze; // + = looking ahead/right
@@ -289,7 +311,10 @@ function renderLoop(now) {
     offset += removed.width;
   }
 
-  el.stream.style.transform = `translateX(${offset}px)`;
+  // translate3d keeps the strip on its own GPU compositor layer for smoother
+  // motion. Round to whole device pixels to avoid subpixel-snap shimmer.
+  const px3d = Math.round(offset * devicePixelRatio) / devicePixelRatio;
+  el.stream.style.transform = `translate3d(${px3d}px, 0, 0)`;
 
   // --- Gaze marker position (normalized -1..1 -> 0..100% of width).
   el.marker.style.left = `${((state.gazeNorm + 1) / 2) * 100}%`;
@@ -313,7 +338,7 @@ function toggleRun() {
 function updateDebug() {
   if (el.debug.classList.contains("hidden")) return;
   el.debug.textContent =
-    `face:   ${state.faceSeen ? "yes" : "NO"}   fps: ${state.fps.toFixed(0)}\n` +
+    `face:   ${state.faceSeen ? "yes" : "NO"}   fps: ${state.fps.toFixed(0)} (gaze) ${state.rfps.toFixed(0)} (render)\n` +
     `iris:   ${state.irisRatio.toFixed(3)}\n` +
     `yaw:    ${state.headYaw.toFixed(3)}\n` +
     `raw:    ${state.gazeRaw.toFixed(3)}  [${state.calib.min.toFixed(2)}..${state.calib.max.toFixed(2)}]\n` +
